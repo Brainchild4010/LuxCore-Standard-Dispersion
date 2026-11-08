@@ -1,3 +1,103 @@
+# LuxCore Standard Dispersion
+
+**MiniHero** is a compact experimental modification of
+[LuxCoreRender](https://github.com/LuxCoreRender/LuxCore) 2.11.2. It improves
+the existing Cauchy dispersion of the standard Glass material while keeping
+the established LuxCore material nodes and scene controls.
+
+This repository is a community fork and is not an official LuxCoreRender
+release.
+
+## Why this fork exists
+
+The original RGB dispersion estimator selects and reconstructs wavelengths at
+individual glass events. At stronger Cauchy values and in deeper glass paths,
+that can produce an unattractive red bias and inconsistent results between
+render engines.
+
+MiniHero uses one wavelength consistently along a complete path and performs
+the color reconstruction with a shared, normalized CIE 1931 approximation.
+CPU, CUDA and OpenCL use the same wavelength range, conversion matrix and
+normalization.
+
+## Main features
+
+- Path-consistent wavelength sampling from 380 to 780 nm
+- Normalized CIE 1931 color reconstruction with neutral unit response
+- Shared CPU, CUDA and OpenCL implementation
+- Low Sobol boot dimension reserved for the path wavelength
+- Existing LuxCore Glass material and Cauchy control remain unchanged
+- Default Russian Roulette start depth raised from 3 to 16
+- Python wheel-builder compatibility fixes for untagged Windows `.pyd` names
+
+## Supported render paths
+
+| Render path | Status |
+| --- | --- |
+| BiDirCPU | Supported |
+| PathCPU | Supported |
+| PATHOCL native CPU threads | Supported |
+| CUDA | Supported |
+| OpenCL | Supported |
+| CUDA/OpenCL plus native CPU | Supported |
+
+## Scope and limitations
+
+- The modification currently targets the standard **Glass** material.
+- RoughGlass, volumes and full spectral transport are outside this small
+  fork's scope.
+- This is a one-wavelength path estimator, not the multi-wavelength HERO
+  renderer developed in the separate ML HERO project.
+- Dispersion still requires additional samples compared with non-dispersive
+  glass.
+- The implementation is experimental and should be validated with production
+  scenes before critical use.
+
+## Source baseline
+
+- Upstream repository: `LuxCoreRender/LuxCore`
+- Upstream tag: `wheels-v2.11.2`
+- Upstream commit: `b872186d2fe995a762f73708c606847eed55843e`
+- Development branch: `luxcore-mod`
+
+## Building a Windows test wheel
+
+Use a Python version matching the target Blender installation. For example,
+Blender 5.2 using Python 3.13 requires a `cp313` build; a module linked against
+`python314.dll` cannot load in that Blender version.
+
+```bat
+git clone --branch luxcore-mod ^
+https://github.com/Brainchild4010/LuxCore-Standard-Dispersion.git
+
+cd LuxCore-Standard-Dispersion
+make deps
+set LUX_BUILD_TYPE=Release
+make pyluxcore
+make wheel-test
+```
+
+The test wheel is written below `out\install\Release\wheel`.
+
+## BlendLuxCore note
+
+No modified Glass node is required. Install the matching `pyluxcore` wheel and
+use the normal Glass material with its existing Cauchy dispersion setting.
+
+The LuxCore default for `path.russianroulette.depth` is 16 in this fork. If a
+front end explicitly exports another value, the exported value takes priority.
+
+## Upstream project and license
+
+LuxCoreRender is the original rendering engine and remains the authoritative
+upstream project. Copyright and attribution stay with the respective LuxCore
+contributors. This fork is distributed under the same Apache License 2.0;
+see `COPYING.txt` and the original project information below.
+
+---
+
+## Original LuxCoreRender README
+
 ### LuxCoreRender
 
 ![LuxCoreRender alt text](https://luxcorerender.org/wp-content/uploads/2017/12/wallpaper_lux_05_rend1b.jpg)
