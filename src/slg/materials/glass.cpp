@@ -24,6 +24,45 @@ using namespace std;
 using namespace luxrays;
 using namespace slg;
 
+// A complete integrated CPU path sample uses one wavelength. The state is
+// thread-local because each render thread traces one sample at a time. The
+// bounce flag reports whether the just sampled BSDF event was wavelength-
+// dependent.
+static thread_local float standardDispersionWaveLength = -1.f;
+static thread_local bool standardDispersionBounceEvent = false;
+
+static bool IsStandardDispersionPathSampleActive() {
+	return (standardDispersionWaveLength >= 380.f) &&
+			(standardDispersionWaveLength <= 780.f);
+}
+
+void slg::SetStandardDispersionPathSample(const float waveLength) {
+	standardDispersionWaveLength = Clamp(waveLength, 380.f, 780.f);
+	standardDispersionBounceEvent = false;
+}
+
+void slg::ClearStandardDispersionPathSample() {
+	standardDispersionWaveLength = -1.f;
+	standardDispersionBounceEvent = false;
+}
+
+void slg::ResetStandardDispersionBounceEvent() {
+	standardDispersionBounceEvent = false;
+}
+
+bool slg::ConsumeStandardDispersionBounceEvent() {
+	const bool result = standardDispersionBounceEvent;
+	standardDispersionBounceEvent = false;
+	return result;
+}
+
+static float GetStandardDispersionWaveLength(const float fallbackU) {
+	if (IsStandardDispersionPathSampleActive())
+		return standardDispersionWaveLength;
+
+	return Lerp(fallbackU, 380.f, 780.f);
+}
+
 //------------------------------------------------------------------------------
 // Glass material
 //------------------------------------------------------------------------------
@@ -100,6 +139,57 @@ static Spectrum WaveLength2RGB(const float waveLength) {
 	return result * normFactor;
 }
 
+// Multi-lobe analytic fit of the CIE 1931 2-degree standard observer from:
+// Wyman, Sloan and Shirley, "Simple Analytic Approximations to the CIE XYZ
+// Color Matching Functions", JCGT 2(2), 2013.
+static float CIE1931GaussianFit(const float waveLength, const float alpha,
+		const float beta, const float gamma, const float delta) {
+	const float t = (waveLength - beta) *
+			((waveLength < beta) ? gamma : delta);
+	return alpha * expf(-.5f * t * t);
+}
+
+static Spectrum WaveLength2CIERGB(const float waveLength) {
+	if ((waveLength < 380.f) || (waveLength > 780.f))
+		return Spectrum();
+
+	const float x =
+			CIE1931GaussianFit(waveLength, .362f, 442.f, .0624f, .0374f) +
+			CIE1931GaussianFit(waveLength, 1.056f, 599.8f, .0264f, .0323f) +
+			CIE1931GaussianFit(waveLength, -.065f, 501.1f, .049f, .0382f);
+	const float y =
+			CIE1931GaussianFit(waveLength, .821f, 568.8f, .0213f, .0247f) +
+			CIE1931GaussianFit(waveLength, .286f, 530.9f, .0613f, .0322f);
+	const float z =
+			CIE1931GaussianFit(waveLength, 1.217f, 437.f, .0845f, .0278f) +
+			CIE1931GaussianFit(waveLength, .681f, 459.f, .0385f, .0725f);
+
+	// A monochromatic CIE color can be outside the renderer's RGB gamut.
+	// Clip only negative display primaries; the per-channel normalization below
+	// preserves a neutral unit response for a uniform 380-780 nm spectrum.
+	// Keep the CPU and OpenCL/CUDA implementations bit-for-bit aligned. This is
+	// the same LuxCore XYZ-to-RGB matrix used by the OpenCL thin-film code and
+	// GlassMaterial_WaveLength2CIERGB().
+	const RGBColor rgb(
+			2.868713378906250f * x - 1.423546671867371f * y - .445165514945984f * z,
+			-1.132583618164062f * x + 2.095324993133545f * y + .037260532379150f * z,
+			.061925172805786f * x - .216627478599548f * y + 1.154703855514526f * z);
+	const Spectrum positiveRGB(Max(0.f, rgb.c[0]), Max(0.f, rgb.c[1]),
+			Max(0.f, rgb.c[2]));
+
+	// Reciprocal mean of positiveRGB over a uniform continuous 380-780 nm
+	// wavelength distribution, evaluated with the shared CPU/GPU matrix.
+	const Spectrum normFactor(2.6351948f, 3.1797323f, 3.3476266f);
+	return positiveRGB * normFactor;
+}
+
+Spectrum slg::GetStandardDispersionSampleColor() {
+	if (!IsStandardDispersionPathSampleActive())
+		return Spectrum(1.f);
+
+	return WaveLength2CIERGB(standardDispersionWaveLength);
+}
+
 static float WaveLength2IOR(const float waveLength, const float IOR, const float B) {
 	// Cauchy's equation for relationship between the refractive index and wavelength
 	// note: Cauchy's lambda is expressed in micrometers while waveLength is in nanometers
@@ -107,12 +197,9 @@ static float WaveLength2IOR(const float waveLength, const float IOR, const float
 	// This is the formula suggested by Neo here, with a changed naming convention from B->A and C-> B:
 	// https://github.com/LuxCoreRender/BlendLuxCore/commit/d3fed046ab62e18226e410b42a16ca1bccefb530#commitcomment-26617643
 	
-	// Compute Cauchy-A assuming the user input IOR at 587.56 nm 
+	// Compute Cauchy-A assuming the user input IOR at 587.56 nm
 	// (Fraunhofer d-line, Helium, used in one definition of the Abbe number)
-	//const float A = IOR - B / Sqr(587.56f / 1000.f);
-
-	// Use the user input IOR directly as Cauchy-A. Equivalent to the B used by old LuxRender.
-	const float A = IOR;
+	const float A = IOR - B / Sqr(587.56f / 1000.f);
 
 	// Cauchy's equation
 	const float cauchyEq = A + B / Sqr(waveLength / 1000.f);
@@ -121,8 +208,8 @@ static float WaveLength2IOR(const float waveLength, const float IOR, const float
 }
 
 Spectrum GlassMaterial::EvalSpecularReflection(const HitPoint &hitPoint,
-		const Vector &localFixedDir, const Spectrum &kr,
-		const float nc, const float nt,
+		const Vector &localFixedDir, const float u0, const Spectrum &kr,
+		const float nc, const float nt, const float cauchyB,
 		Vector *localSampledDir, 
 		const float localFilmThickness, const float localFilmIor) {
 	if (kr.Black())
@@ -131,7 +218,10 @@ Spectrum GlassMaterial::EvalSpecularReflection(const HitPoint &hitPoint,
 	const float cosTheta = CosTheta(localFixedDir);
 	*localSampledDir = Vector(-localFixedDir.x, -localFixedDir.y, localFixedDir.z);
 
-	const float ntc = nt / nc;
+	const float lnt = ((cauchyB > 0.f) &&
+			IsStandardDispersionPathSampleActive()) ?
+			WaveLength2IOR(GetStandardDispersionWaveLength(u0), nt, cauchyB) : nt;
+	const float ntc = lnt / nc;
 	const Spectrum result = kr * FresnelTexture::CauchyEvaluate(ntc, cosTheta);
 
 	if (localFilmThickness > 0.f) {
@@ -152,12 +242,18 @@ Spectrum GlassMaterial::EvalSpecularTransmission(const HitPoint &hitPoint,
 	Spectrum lkt;
 	float lnt;
 	if (cauchyB > 0.f) {
-		// Select the wavelength to sample
-		const float waveLength = Lerp(u0, 380.f, 780.f);
-
+		// Reuse the wavelength selected once for an enabled integrated CPU path.
+		// Other engines retain LuxCore's original per-bounce behavior until
+		// they receive their own complete path-level integration.
+		const float waveLength = GetStandardDispersionWaveLength(u0);
 		lnt = WaveLength2IOR(waveLength, nt, cauchyB);
 
-		lkt = kt * WaveLength2RGB(waveLength);
+		if (IsStandardDispersionPathSampleActive())
+			// RGB reconstruction is applied once to each completed contribution.
+			lkt = kt;
+		else
+			// Preserve the original LuxCore estimator in engines not yet integrated.
+			lkt = kt * WaveLength2RGB(waveLength);
 	} else {
 		lnt = nt;
 		lkt = kt;
@@ -174,7 +270,6 @@ Spectrum GlassMaterial::EvalSpecularTransmission(const HitPoint &hitPoint,
 	// Handle total internal reflection for transmission
 	if (sint2 >= 1.f)
 		return Spectrum();
-
 	const float cost = sqrtf(Max(0.f, 1.f - sint2)) * (entering ? -1.f : 1.f);
 	*localSampledDir = Vector(-eta * localFixedDir.x, -eta * localFixedDir.y, cost);
 
@@ -209,7 +304,8 @@ Spectrum GlassMaterial::Sample(const HitPoint &hitPoint,
 	const float localFilmIor = (localFilmThickness > 0.f && filmIor) ? filmIor->GetFloatValue(hitPoint) : 1.f;
 	Vector reflLocalSampledDir;
 	const Spectrum refl = EvalSpecularReflection(hitPoint, localFixedDir,
-			kr, nc, nt, &reflLocalSampledDir, localFilmThickness, localFilmIor);
+			u0, kr, nc, nt, cauchyBValue, &reflLocalSampledDir,
+			localFilmThickness, localFilmIor);
 
 	// Decide to transmit or reflect
 	float threshold;
@@ -252,6 +348,9 @@ Spectrum GlassMaterial::Sample(const HitPoint &hitPoint,
 		
 		result = refl;
 	}
+
+	if ((cauchyBValue > 0.f) && IsStandardDispersionPathSampleActive())
+		standardDispersionBounceEvent = true;
 	
 	return result / *pdfW;
 }

@@ -36,10 +36,14 @@ namespace slg {
 // Bidirectional path tracing CPU render engine
 //------------------------------------------------------------------------------
 
-typedef struct {
+typedef struct PathVertexVM {
 	BSDF bsdf;
 	BSDFEvent bsdfEvent;
 	luxrays::Spectrum throughput;
+	// True after this sub-path has sampled a wavelength-dependent glass event.
+	// It travels with stored BiDir vertices so RGB reconstruction can be applied
+	// exactly once to the completed contribution.
+	bool dispersionUsed = false;
 	u_int lightID, depth;
 
 	// Check Iliyan Georgiev's latest technical report for the details of how

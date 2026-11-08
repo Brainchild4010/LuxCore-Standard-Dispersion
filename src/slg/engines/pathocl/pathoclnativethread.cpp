@@ -149,7 +149,7 @@ void PathOCLNativeRenderThread::RenderThreadImpl(std::stop_token stop_token) {
 	PathTracerThreadState pathTracerThreadState(intersectionDevice,
 			eyeSampler, lightSampler,
 			engine->renderConfig.GetScene(), *film,
-			&varianceClamping);
+			&varianceClamping, false, true);
 
 	//--------------------------------------------------------------------------
 	// Trace paths
@@ -183,7 +183,6 @@ void PathOCLNativeRenderThread::RenderThreadImpl(std::stop_token stop_token) {
 			engine->photonGICache->Update(engine->renderOCLThreads.size() + threadIndex, engine->GetTotalEyeSPP());
 		}
 	}
-
 
 	threadDone = true;
 

@@ -69,6 +69,8 @@ void PathCPURenderThread::RenderFunc(std::stop_token stop_token) {
 		Properties()
 	);
 	eyeSampler->SetThreadIndex(threadIndex);
+	// The path tracer already includes the dedicated low Sobol wavelength
+	// dimension in its boot sample range.
 	eyeSampler->RequestSamples(PIXEL_NORMALIZED_ONLY, pathTracer.eyeSampleSize);
 
 	if (pathTracer.hybridBackForwardEnable) {
@@ -88,7 +90,9 @@ void PathCPURenderThread::RenderFunc(std::stop_token stop_token) {
 		);
 
 		lightSampler->SetThreadIndex(threadIndex);
-		lightSampler->RequestSamples(SCREEN_NORMALIZED_ONLY, pathTracer.lightSampleSize);
+		// Hybrid light tracing uses the same path-level estimator independently.
+		lightSampler->RequestSamples(SCREEN_NORMALIZED_ONLY,
+				pathTracer.lightSampleSize);
 	}
 
 	// Setup variance clamping
@@ -99,7 +103,7 @@ void PathCPURenderThread::RenderFunc(std::stop_token stop_token) {
 			eyeSampler, lightSampler,
 			engine->renderConfig.GetScene(),
 			engine->GetFilm(),
-			&varianceClamping);
+			&varianceClamping, false, true);
 
 	//--------------------------------------------------------------------------
 	// Trace paths

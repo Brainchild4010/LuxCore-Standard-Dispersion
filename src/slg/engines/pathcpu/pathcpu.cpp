@@ -129,6 +129,7 @@ void PathCPURenderEngine::StartLockLess() {
 	//--------------------------------------------------------------------------
 
 	pathTracer.ParseOptions(cfg, *GetDefaultProps());
+	pathTracer.ReserveStandardDispersionSampleDimension();
 
 	if (pathTracer.hybridBackForwardEnable)
 		lightSamplerSharedData = MetropolisSamplerSharedData::FromProperties(Properties(), seedBaseGenerator, GetFilm());

@@ -28,6 +28,7 @@
 #include "slg/engines/bidircpu/bidircpu.h"
 #include "slg/cameras/camera.h"
 #include "slg/lights/light.h"
+#include "slg/materials/glass.h"
 
 using namespace std;
 using namespace luxrays;
@@ -48,6 +49,14 @@ const Film::FilmChannels BiDirCPURenderThread::eyeSampleResultsChannels({
 const Film::FilmChannels BiDirCPURenderThread::lightSampleResultsChannels({
 	Film::RADIANCE_PER_SCREEN_NORMALIZED
 }); 
+
+static Spectrum ApplyStandardDispersionColor(const Spectrum &value,
+		const bool dispersionUsed) {
+	if (!dispersionUsed)
+		return value;
+
+	return Spectrum(value * GetStandardDispersionSampleColor());
+}
 
 BiDirCPURenderThread::BiDirCPURenderThread(BiDirCPURenderEngine *engine,
 		const u_int index, IntersectionDevice *device) :
@@ -323,8 +332,12 @@ void BiDirCPURenderThread::ConnectVertices(const float time,
 
 				const float misWeight = 1.f / (lightWeight + 1.f + eyeWeight);
 
-				eyeSampleResult.radiance[lightVertex.lightID] += (misWeight * geometryTerm) * eyeVertex.throughput * eyeBsdfEval *
-						connectionThroughput * lightBsdfEval * lightVertex.throughput;
+				const Spectrum contribution = (misWeight * geometryTerm) *
+						eyeVertex.throughput * eyeBsdfEval * connectionThroughput *
+						lightBsdfEval * lightVertex.throughput;
+				eyeSampleResult.radiance[lightVertex.lightID] +=
+						ApplyStandardDispersionColor(contribution,
+							eyeVertex.dispersionUsed || lightVertex.dispersionUsed);
 			}
 		}
 	}
@@ -430,8 +443,10 @@ void BiDirCPURenderThread::ConnectToEye(const float time,
 		(misVmWeightFactor + lightVertex.dVCM + lightVertex.dVC * MIS(bsdfRevPdfW));
 	const float misWeight = 1.f / (weightLight + 1.f);
 
-	const Spectrum radiance = (misWeight * fluxToRadianceFactor) *
-		connectionThroughput * lightVertex.throughput * bsdfEval;
+	const Spectrum radiance = ApplyStandardDispersionColor(
+			(misWeight * fluxToRadianceFactor) * connectionThroughput *
+					lightVertex.throughput * bsdfEval,
+			lightVertex.dispersionUsed);
 
 	SampleResult &sampleResult = AddResult(sampleResults, true);
 	sampleResult.filmX = filmX;
@@ -514,8 +529,12 @@ void BiDirCPURenderThread::DirectLightSampling(const float time,
 						// result multiplied by cosThetaToLight
 						const float factor = 1.f / directLightSamplingPdfW;
 
-						eyeSampleResult.radiance[light->GetID()] += (misWeight * factor) *
-								eyeVertex.throughput * connectionThroughput * lightRadiance * bsdfEval;
+						const Spectrum contribution = (misWeight * factor) *
+								eyeVertex.throughput * connectionThroughput *
+								lightRadiance * bsdfEval;
+						eyeSampleResult.radiance[light->GetID()] +=
+								ApplyStandardDispersionColor(contribution,
+									eyeVertex.dispersionUsed);
 
 						assert (eyeSampleResult.IsValid());
 					}
@@ -537,7 +556,9 @@ void BiDirCPURenderThread::DirectHitLight(
 		return;
 
 	if (eyeVertex.depth == 1) {
-		*radiance += eyeVertex.throughput * lightRadiance;
+		*radiance += ApplyStandardDispersionColor(
+				eyeVertex.throughput * lightRadiance,
+				eyeVertex.dispersionUsed);
 		return;
 	}
 
@@ -556,7 +577,9 @@ void BiDirCPURenderThread::DirectHitLight(
 		MIS(emissionPdfW * lightPickPdf) * eyeVertex.dVC;
 	const float misWeight = 1.f / (weightCamera + 1.f);
 
-	*radiance += misWeight * eyeVertex.throughput * lightRadiance;
+	*radiance += ApplyStandardDispersionColor(
+			misWeight * eyeVertex.throughput * lightRadiance,
+			eyeVertex.dispersionUsed);
 
 	assert (radiance->IsValid());
 }
@@ -611,6 +634,7 @@ bool BiDirCPURenderThread::TraceLightPath(const float time,
 
 	// Initialize the light path
 	PathVertexVM lightVertex;
+	lightVertex.dispersionUsed = false;
 	lightVertex.lightID = light->GetID();
 	
 	float lightEmitPdfW, lightDirectPdfW, cosThetaAtLight;
@@ -714,12 +738,15 @@ bool BiDirCPURenderThread::Bounce(const float time, const SamplerUPtr& sampler,
 	Vector sampledDir;
 	BSDFEvent &event = pathVertex->bsdfEvent;
 	float bsdfPdfW, cosSampledDir;
+	ResetStandardDispersionBounceEvent();
 	const Spectrum bsdfSample = pathVertex->bsdf.Sample(&sampledDir,
 			sampler->GetSample(sampleOffset),
 			sampler->GetSample(sampleOffset + 1),
 			&bsdfPdfW, &cosSampledDir, &event);
 	if (bsdfSample.Black())
 		return false;
+	pathVertex->dispersionUsed = pathVertex->dispersionUsed ||
+			ConsumeStandardDispersionBounceEvent();
 
 	float bsdfRevPdfW;
 	if (event & SPECULAR)
@@ -807,10 +834,11 @@ void BiDirCPURenderThread::RenderFunc(std::stop_token stop_token) {
 		engine->samplerSharedData,
 		Properties()
 	);
-	const u_int sampleSize =
+	const u_int dispersionSampleIndex =
 		sampleBootSize + // To generate the initial light vertex and trace eye ray
 		engine->maxLightPathDepth * sampleLightStepSize + // For each light vertex
 		engine->maxEyePathDepth * sampleEyeStepSize; // For each eye vertex
+	const u_int sampleSize = dispersionSampleIndex + 1;
 	sampler->SetThreadIndex(threadIndex);
 	sampler->RequestSamples(PIXEL_NORMALIZED_AND_SCREEN_NORMALIZED, sampleSize);
 
@@ -839,6 +867,8 @@ void BiDirCPURenderThread::RenderFunc(std::stop_token stop_token) {
 
 		const float timeSample = sampler->GetSample(12);
 		const float time = scene.GetCamera().GenerateRayTime(timeSample);
+		SetStandardDispersionPathSample(Lerp(
+				sampler->GetSample(dispersionSampleIndex), 380.f, 780.f));
 
 		/*
 		// Sample a point on the camera lens
@@ -865,6 +895,7 @@ void BiDirCPURenderThread::RenderFunc(std::stop_token stop_token) {
 			//------------------------------------------------------------------
 
 			PathVertexVM eyeVertex;
+			eyeVertex.dispersionUsed = false;
 			SampleResult &eyeSampleResult = AddResult(sampleResults, false);
 
 			eyeSampleResult.filmX = sampler->GetSample(0);
@@ -995,7 +1026,9 @@ void BiDirCPURenderThread::RenderFunc(std::stop_token stop_token) {
 							const SpectrumGroup causticRadiance = photonGICache->ConnectWithCausticPaths(eyeVertex.bsdf);
 
 							if (!causticRadiance.Black())
-								eyeSampleResult.radiance.AddWeighted(eyeVertex.throughput, causticRadiance);
+								eyeSampleResult.radiance.AddWeighted(
+										ApplyStandardDispersionColor(eyeVertex.throughput,
+											eyeVertex.dispersionUsed), causticRadiance);
 							
 							photonGICausticCacheUsed = true;
 						}

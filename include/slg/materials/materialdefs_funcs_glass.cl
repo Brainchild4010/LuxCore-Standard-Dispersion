@@ -112,12 +112,9 @@ OPENCL_FORCE_INLINE float GlassMaterial_WaveLength2IOR(const float waveLength, c
 	// This is the formula suggested by Neo here, with a changed naming convention from B->A and C-> B:
 	// https://github.com/LuxCoreRender/BlendLuxCore/commit/d3fed046ab62e18226e410b42a16ca1bccefb530#commitcomment-26617643
 	
-	// Compute Cauchy-A assuming the user input IOR at 587.56 nm 
+	// Compute Cauchy-A assuming the user input IOR at 587.56 nm
 	// (Fraunhofer d-line, Helium, used in one definition of the Abbe number)
-	//const float A = IOR - B / Sqr(587.56f / 1000.f);
-
-	// Use the user input IOR directly as Cauchy-A. Equivalent to the B used by old LuxRender.
-	const float A = IOR;
+	const float A = IOR - B / Sqr(587.56f / 1000.f);
 
 	// Cauchy's equation
 	const float cauchyEq = A + B / Sqr(waveLength / 1000.f);
@@ -125,9 +122,41 @@ OPENCL_FORCE_INLINE float GlassMaterial_WaveLength2IOR(const float waveLength, c
 	return cauchyEq;
 }
 
+OPENCL_FORCE_INLINE float GlassMaterial_CIE1931GaussianFit(const float waveLength,
+		const float alpha, const float beta, const float gamma, const float delta) {
+	const float t = (waveLength - beta) *
+			((waveLength < beta) ? gamma : delta);
+	return alpha * exp(-.5f * t * t);
+}
+
+OPENCL_FORCE_INLINE float3 GlassMaterial_WaveLength2CIERGB(const float waveLength) {
+	if ((waveLength < 380.f) || (waveLength > 780.f))
+		return BLACK;
+
+	const float x =
+			GlassMaterial_CIE1931GaussianFit(waveLength, .362f, 442.f, .0624f, .0374f) +
+			GlassMaterial_CIE1931GaussianFit(waveLength, 1.056f, 599.8f, .0264f, .0323f) +
+			GlassMaterial_CIE1931GaussianFit(waveLength, -.065f, 501.1f, .049f, .0382f);
+	const float y =
+			GlassMaterial_CIE1931GaussianFit(waveLength, .821f, 568.8f, .0213f, .0247f) +
+			GlassMaterial_CIE1931GaussianFit(waveLength, .286f, 530.9f, .0613f, .0322f);
+	const float z =
+			GlassMaterial_CIE1931GaussianFit(waveLength, 1.217f, 437.f, .0845f, .0278f) +
+			GlassMaterial_CIE1931GaussianFit(waveLength, .681f, 459.f, .0385f, .0725f);
+
+	// LuxCore default ColorSystem XYZ-to-RGB matrix, shared with the thin-film
+	// OpenCL implementation.
+	const float3 rgb = MAKE_FLOAT3(
+			2.868713378906250f * x - 1.423546671867371f * y - .445165514945984f * z,
+			-1.132583618164062f * x + 2.095324993133545f * y + .037260532379150f * z,
+			.061925172805786f * x - .216627478599548f * y + 1.154703855514526f * z);
+
+	return fmax(rgb, BLACK) * MAKE_FLOAT3(2.6351948f, 3.1797323f, 3.3476266f);
+}
+
 OPENCL_FORCE_INLINE float3 GlassMaterial_EvalSpecularReflection(__global const HitPoint *hitPoint,
-		const float3 localFixedDir, const float3 kr,
-		const float nc, const float nt,
+		const float3 localFixedDir, const float u0, const float3 kr,
+		const float nc, const float nt, const float cauchyB,
 		float3 *sampledDir, const float localFilmThickness, const float localFilmIor) {
 	if (Spectrum_IsBlack(kr))
 		return BLACK;
@@ -135,7 +164,9 @@ OPENCL_FORCE_INLINE float3 GlassMaterial_EvalSpecularReflection(__global const H
 	const float costheta = CosTheta(localFixedDir);
 	*sampledDir = MAKE_FLOAT3(-localFixedDir.x, -localFixedDir.y, localFixedDir.z);
 
-	const float ntc = nt / nc;
+	const float lnt = (cauchyB > 0.f) ?
+			GlassMaterial_WaveLength2IOR(mix(380.f, 780.f, u0), nt, cauchyB) : nt;
+	const float ntc = lnt / nc;
 	const float3 result = kr * FresnelCauchy_Evaluate(ntc, costheta);
 	
 	if (localFilmThickness > 0.f) {
@@ -146,7 +177,7 @@ OPENCL_FORCE_INLINE float3 GlassMaterial_EvalSpecularReflection(__global const H
 }
 
 OPENCL_FORCE_INLINE float3 GlassMaterial_EvalSpecularTransmission(__global const HitPoint *hitPoint,
-		const float3 localFixedDir, const float u0,
+		const float3 localFixedDir, const float u0, const bool integratedPathSample,
 		const float3 kt, const float nc, const float nt, const float cauchyB,
 		float3 *sampledDir) {
 	if (Spectrum_IsBlack(kt))
@@ -161,7 +192,8 @@ OPENCL_FORCE_INLINE float3 GlassMaterial_EvalSpecularTransmission(__global const
 
 		lnt = GlassMaterial_WaveLength2IOR(waveLength, nt, cauchyB);
 
-		lkt = kt * GlassMaterial_WaveLength2RGB(waveLength);
+		lkt = integratedPathSample ? kt :
+				(kt * GlassMaterial_WaveLength2RGB(waveLength));
 	} else {
 		lnt = nt;
 		lkt = kt;
@@ -224,10 +256,13 @@ OPENCL_FORCE_INLINE void GlassMaterial_Sample(__global const Material* restrict 
 	const float nt = ExtractInteriorIors(hitPoint, material->glass.interiorIorTexIndex TEXTURES_PARAM);
 
 	const float cauchyB = (material->glass.cauchyBTex != NULL_INDEX) ? Texture_GetFloatValue(material->glass.cauchyBTex, hitPoint TEXTURES_PARAM) : -1.f;
+	// A negative u1 is an internal marker used only by the integrated PATHOCL
+	// estimator. u1 is otherwise unused by the ideal glass BSDF.
+	const bool integratedPathSample = (u1 < 0.f);
 
 	float3 transLocalSampledDir; 
 	const float3 trans = GlassMaterial_EvalSpecularTransmission(hitPoint, fixedDir, u0,
-			kt, nc, nt, cauchyB, &transLocalSampledDir);
+			integratedPathSample, kt, nc, nt, cauchyB, &transLocalSampledDir);
 	
 	const float localFilmThickness = (material->glass.filmThicknessTexIndex != NULL_INDEX) 
 									 ? Texture_GetFloatValue(material->glass.filmThicknessTexIndex, hitPoint TEXTURES_PARAM) : 0.f;
@@ -236,7 +271,8 @@ OPENCL_FORCE_INLINE void GlassMaterial_Sample(__global const Material* restrict 
 	
 	float3 reflLocalSampledDir;
 	const float3 refl = GlassMaterial_EvalSpecularReflection(hitPoint, fixedDir,
-			kr, nc, nt, &reflLocalSampledDir, localFilmThickness, localFilmIor);
+			u0, kr, nc, nt, cauchyB, &reflLocalSampledDir,
+			localFilmThickness, localFilmIor);
 
 	// Decide to transmit or reflect
 	float threshold;

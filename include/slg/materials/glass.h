@@ -23,6 +23,16 @@
 
 namespace slg {
 
+// Standard LuxCore dispersion path state (BiDir CPU and PATHCPU).
+// One wavelength is selected for each complete path sample. The RGB estimator
+// color is applied once when a contribution contains a dispersive sub-path,
+// instead of once at every glass interface.
+extern void SetStandardDispersionPathSample(const float waveLength);
+extern void ClearStandardDispersionPathSample();
+extern void ResetStandardDispersionBounceEvent();
+extern bool ConsumeStandardDispersionBounceEvent();
+extern luxrays::Spectrum GetStandardDispersionSampleColor();
+
 //------------------------------------------------------------------------------
 // Glass material
 //------------------------------------------------------------------------------
@@ -68,7 +78,8 @@ public:
 
 	static luxrays::Spectrum EvalSpecularReflection(const HitPoint &hitPoint,
 			const luxrays::Vector &localFixedDir,
-			const luxrays::Spectrum &kr, const float nc, const float nt,
+			const float u0, const luxrays::Spectrum &kr,
+			const float nc, const float nt, const float cauchyB,
 			luxrays::Vector *localSampledDir,
 			const float localFilmThickness, const float localFilmIor);
 	static luxrays::Spectrum EvalSpecularTransmission(const HitPoint &hitPoint,

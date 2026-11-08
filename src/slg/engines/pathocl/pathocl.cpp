@@ -104,6 +104,7 @@ void PathOCLRenderEngine::StartLockLess() {
 
 	auto defaultProps = PathOCLRenderEngine::GetDefaultProps();
 	pathTracer.ParseOptions(cfg, *defaultProps);
+	pathTracer.ReserveStandardDispersionSampleDimension();
 
 	//--------------------------------------------------------------------------
 	// Restore render state if there is one

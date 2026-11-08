@@ -25,9 +25,17 @@ using namespace luxrays;
 using namespace slg;
 
 void CompiledScene::CompilePathTracer() {
-	compiledPathTracer.eyeSampleBootSize = pathTracer->eyeSampleBootSize;
+	// Keep the wavelength in a low Sobol dimension directly after the camera
+	// boot samples. High dimensions (hundreds for deep paths) produced visible
+	// device/seed dependent color casts at practical sample counts.
+	compiledPathTracer.eyeSampleBootSize = pathTracer->eyeSampleBootSize +
+			(pathTracer->IsStandardDispersionSampleDimensionReserved() ? 0 : 1);
 	compiledPathTracer.eyeSampleStepSize = pathTracer->eyeSampleStepSize;
-	compiledPathTracer.eyeSampleSize = pathTracer->eyeSampleSize;
+	// Reserve one additional sampler dimension for GPU-only engines. PATHOCL
+	// already reserves the same low dimension in the shared PathTracer layout so
+	// its native CPU and GPU threads use an identical wavelength dimension.
+	compiledPathTracer.eyeSampleSize = pathTracer->eyeSampleSize +
+			(pathTracer->IsStandardDispersionSampleDimensionReserved() ? 0 : 1);
 
 	compiledPathTracer.maxPathDepth.depth = pathTracer->maxPathDepth.depth;
 	compiledPathTracer.maxPathDepth.diffuseDepth = pathTracer->maxPathDepth.diffuseDepth;

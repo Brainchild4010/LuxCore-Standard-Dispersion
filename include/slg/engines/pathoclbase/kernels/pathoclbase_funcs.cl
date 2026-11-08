@@ -109,6 +109,14 @@ OPENCL_FORCE_INLINE void GenerateEyePath(
 			pixelFilterDistribution
 			SAMPLER_PARAM);
 
+	// Select the wavelength once per eye path. It occupies the dedicated final
+	// boot dimension, immediately before the shifted per-bounce dimensions. A
+	// low Sobol dimension avoids device/seed dependent color casts.
+	taskState->standardDispersionWaveLength = mix(380.f, 780.f,
+			Sampler_GetSample(taskConfig,
+				taskConfig->pathTracer.eyeSampleBootSize - 1 SAMPLER_PARAM));
+	taskState->standardDispersionUsed = false;
+
 	// Generate the came ray
 	const float timeSample = Sampler_GetSample(taskConfig, IDX_EYE_TIME SAMPLER_PARAM);
 

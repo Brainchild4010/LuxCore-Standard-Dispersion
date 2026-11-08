@@ -25,6 +25,7 @@
 #include "slg/samplers/metropolis.h"
 #include "slg/utils/varianceclamping.h"
 #include "slg/cameras/camera.h"
+#include "slg/materials/glass.h"
 
 using namespace std;
 using namespace luxrays;
@@ -39,9 +40,11 @@ PathTracerThreadState::PathTracerThreadState(IntersectionDevice *dev,
 		const SamplerUPtr& lSampler,
 		SceneConstRef scn, FilmRef flm,
 		const VarianceClamping *varClamping,
-		const bool useFilmSplat) : device(dev),
+		const bool useFilmSplat,
+		const bool stdDispersionPathSampling) : device(dev),
 		eyeSampler(eSampler), lightSampler(lSampler), scene(scn), film(flm),
-		varianceClamping(varClamping) {
+		varianceClamping(varClamping),
+		standardDispersionPathSampling(stdDispersionPathSampling) {
 	// Initialize Eye SampleResults
 	eyeSampleResults.resize(1);
 	PathTracer::InitEyeSampleResults(film, eyeSampleResults, useFilmSplat);
@@ -76,12 +79,20 @@ const Film::FilmChannels PathTracer::lightSampleResultsChannels({
 	Film::RADIANCE_PER_SCREEN_NORMALIZED
 }); 
 
-PathTracer::PathTracer() : pixelFilterDistribution(nullptr),
-		photonGICache(nullptr) {
+PathTracer::PathTracer() : standardDispersionSampleDimensionReserved(false),
+		pixelFilterDistribution(nullptr), photonGICache(nullptr) {
 }
 
 PathTracer::~PathTracer() {
 	delete pixelFilterDistribution;
+}
+
+static Spectrum ApplyStandardDispersionColor(const Spectrum &value,
+		const bool dispersionUsed) {
+	if (!dispersionUsed)
+		return value;
+
+	return Spectrum(value * GetStandardDispersionSampleColor());
 }
 
 void PathTracer::InitPixelFilterDistribution(const FilterUPtr& pixelFilter) {
@@ -140,7 +151,7 @@ PathTracer::DirectLightResult PathTracer::DirectLightSampling(
 		const float u3, const float u4,
 		const EyePathInfo &pathInfo, const Spectrum &pathThroughput,
 		const BSDF &bsdf, SampleResult *sampleResult,
-		const bool useBSDFEVal) const {
+		const bool useBSDFEVal, const bool dispersionUsed) const {
 	if (!bsdf.IsDelta()) {
 		// Select the light strategy to use
 		auto& lightStrategy =
@@ -232,7 +243,9 @@ PathTracer::DirectLightResult PathTracer::DirectLightSampling(
 							const float weight = misEnabled ? PowerHeuristic(directLightSamplingPdfW, bsdfPdfW) : 1.f;
 							const Spectrum incomingRadiance = bsdfEval * (weight * factor) * connectionThroughput * lightRadiance;
 
-							sampleResult->AddDirectLight(light->GetID(), event, pathThroughput, incomingRadiance, 1.f);
+							sampleResult->AddDirectLight(light->GetID(), event,
+									ApplyStandardDispersionColor(pathThroughput, dispersionUsed),
+									incomingRadiance, 1.f);
 
 							// The first path vertex is not handled by AddDirectLight(). This is valid
 							// for irradiance AOV only if it is not a SPECULAR material.
@@ -277,7 +290,7 @@ void PathTracer::DirectHitFiniteLight(SceneConstRef scene,
 		const EyePathInfo &pathInfo,
 		const Spectrum &pathThroughput, const Ray &ray,
 		const float distance, const BSDF &bsdf,
-		SampleResult *sampleResult) const {
+		SampleResult *sampleResult, const bool dispersionUsed) const {
 
 	auto lightSource = bsdf.GetLightSource();
 
@@ -312,13 +325,16 @@ void PathTracer::DirectHitFiniteLight(SceneConstRef scene,
 		} else
 			weight = 1.f;
 
-		sampleResult->AddEmission(bsdf.GetLightID(), pathThroughput, weight * emittedRadiance);
+		sampleResult->AddEmission(bsdf.GetLightID(),
+				ApplyStandardDispersionColor(pathThroughput, dispersionUsed),
+				weight * emittedRadiance);
 	}
 }
 
 void PathTracer::DirectHitInfiniteLight(SceneConstRef scene,
 		const EyePathInfo &pathInfo, const Spectrum &pathThroughput,
-		const Ray &ray, const BSDF *bsdf, SampleResult *sampleResult) const {
+		const Ray &ray, const BSDF *bsdf, SampleResult *sampleResult,
+		const bool dispersionUsed) const {
 	// If the material is shadow transparent, Direct Light sampling
 	// will take care of transporting all emitted light
 	if (bsdf && bsdf->hitPoint.throughShadowTransparency)
@@ -342,7 +358,9 @@ void PathTracer::DirectHitInfiniteLight(SceneConstRef scene,
 			} else
 				weight = 1.f;
 
-			sampleResult->AddEmission(envLight.GetID(), pathThroughput, weight * envRadiance);
+			sampleResult->AddEmission(envLight.GetID(),
+					ApplyStandardDispersionColor(pathThroughput, dispersionUsed),
+					weight * envRadiance);
 		}
 	}	
 }
@@ -398,6 +416,7 @@ void PathTracer::RenderEyePath(IntersectionDevice *device,
 	bool photonGICausticCacheUsed = false;
 	bool photonGICacheEnabledOnLastHit = false;
 	bool albedoToDo = true;
+	bool dispersionUsed = false;
 	sampleResult.albedo = Spectrum(); // Just in case albedoToDo is never true
 	sampleResult.shadingNormal = Normal();
 	Spectrum pathThroughput(eyeTroughput);
@@ -430,7 +449,7 @@ void PathTracer::RenderEyePath(IntersectionDevice *device,
 					checkDirectLightHit) {
 				DirectHitInfiniteLight(scene, pathInfo, pathThroughput,
 						eyeRay, sampleResult.firstPathVertex ? nullptr : &bsdf,
-						&sampleResult);
+						&sampleResult, dispersionUsed);
 			}
 
 			if (sampleResult.firstPathVertex) {
@@ -479,10 +498,14 @@ void PathTracer::RenderEyePath(IntersectionDevice *device,
 		//----------------------------------------------------------------------
 
 		if (bsdf.HasBakeMap(COMBINED)) {
-			sampleResult.radiance[0] += pathThroughput * bsdf.GetBakeMapValue();
+			sampleResult.radiance[0] +=
+					ApplyStandardDispersionColor(pathThroughput, dispersionUsed) *
+					bsdf.GetBakeMapValue();
 			break;
 		} else if (bsdf.HasBakeMap(LIGHTMAP)) {
-			sampleResult.radiance[0] += pathThroughput * bsdf.Albedo() * bsdf.GetBakeMapValue();
+			sampleResult.radiance[0] +=
+					ApplyStandardDispersionColor(pathThroughput, dispersionUsed) *
+					bsdf.Albedo() * bsdf.GetBakeMapValue();
 			break;
 		}
 
@@ -492,7 +515,7 @@ void PathTracer::RenderEyePath(IntersectionDevice *device,
 
 		if (bsdf.IsLightSource() && checkDirectLightHit) {
 			DirectHitFiniteLight(scene, pathInfo, pathThroughput,
-					eyeRay, eyeRayHit.t, bsdf, &sampleResult);
+					eyeRay, eyeRayHit.t, bsdf, &sampleResult, dispersionUsed);
 		}
 
 		//----------------------------------------------------------------------
@@ -506,13 +529,24 @@ void PathTracer::RenderEyePath(IntersectionDevice *device,
 			if (photonGICache->GetDebugType() == PhotonGIDebugType::PGIC_DEBUG_SHOWINDIRECT) {
 				if (isPhotonGIEnabled) {
 					const SpectrumGroup *group = photonGICache->GetIndirectRadiance(bsdf);
-					if (group)
-						sampleResult.radiance += *group;
+					if (group) {
+						if (dispersionUsed)
+							sampleResult.radiance.AddWeighted(
+									GetStandardDispersionSampleColor(), *group);
+						else
+							sampleResult.radiance += *group;
+					}
 				}
 				break;
 			} else if (photonGICache->GetDebugType() == PhotonGIDebugType::PGIC_DEBUG_SHOWCAUSTIC) {
-				if (isPhotonGIEnabled)
-					sampleResult.radiance += photonGICache->ConnectWithCausticPaths(bsdf);
+				if (isPhotonGIEnabled) {
+					const SpectrumGroup group = photonGICache->ConnectWithCausticPaths(bsdf);
+					if (dispersionUsed)
+						sampleResult.radiance.AddWeighted(
+								GetStandardDispersionSampleColor(), group);
+					else
+						sampleResult.radiance += group;
+				}
 				break;
 			} else if (photonGICache->GetDebugType() == PhotonGIDebugType::PGIC_DEBUG_SHOWINDIRECTPATHMIX) {
 				// Check if the cache is enabled for this material
@@ -538,7 +572,9 @@ void PathTracer::RenderEyePath(IntersectionDevice *device,
 						const SpectrumGroup causticRadiance = photonGICache->ConnectWithCausticPaths(bsdf);
 
 						if (!causticRadiance.Black()) {
-							sampleResult.radiance.AddWeighted(pathThroughput, causticRadiance);
+							sampleResult.radiance.AddWeighted(
+								ApplyStandardDispersionColor(pathThroughput, dispersionUsed),
+								causticRadiance);
 							photonGICausticCacheUsed = true;
 						}
 					}
@@ -551,7 +587,9 @@ void PathTracer::RenderEyePath(IntersectionDevice *device,
 								passThrough))) {
 						const SpectrumGroup *group = photonGICache->GetIndirectRadiance(bsdf);
 						if (group)
-							sampleResult.radiance.AddWeighted(pathThroughput, *group);
+							sampleResult.radiance.AddWeighted(
+									ApplyStandardDispersionColor(pathThroughput, dispersionUsed),
+									*group);
 						// I can terminate the path, all done
 						break;
 					}
@@ -582,7 +620,7 @@ void PathTracer::RenderEyePath(IntersectionDevice *device,
 				sampler.GetSample(sampleOffset + 4),
 				sampler.GetSample(sampleOffset + 5),
 				pathInfo, 
-				pathThroughput, bsdf, &sampleResult);
+				pathThroughput, bsdf, &sampleResult, true, dispersionUsed);
 
 		if (sampleResult.lastPathVertex)
 			break;
@@ -612,11 +650,14 @@ void PathTracer::RenderEyePath(IntersectionDevice *device,
 				cosSampledDir = -1.f;
 				bsdfEvent = pathInfo.lastBSDFEvent;
 			} else {
+				ResetStandardDispersionBounceEvent();
 				bsdfSample = bsdf.Sample(&sampledDir,
 						sampler.GetSample(sampleOffset + 6),
 						sampler.GetSample(sampleOffset + 7),
 						&bsdfPdfW, &cosSampledDir, &bsdfEvent);
 				pathInfo.isPassThroughPath = false;
+				dispersionUsed = dispersionUsed ||
+						ConsumeStandardDispersionBounceEvent();
 			}
 		}
 
@@ -708,7 +749,8 @@ void PathTracer::ConnectToEye(IntersectionDevice *device,
 		const float u0, const float u1, const float u2,
 		const LightSource &light, const BSDF &bsdf, 
 		const Spectrum &flux, const LightPathInfo &pathInfo,
-		vector<SampleResult> &sampleResults) const {
+		vector<SampleResult> &sampleResults,
+		const bool dispersionUsed) const {
 	// I don't connect camera invisible objects with the eye
 	if (bsdf.IsCameraInvisible() || bsdf.IsDelta())
 		return;
@@ -800,7 +842,9 @@ void PathTracer::ConnectToEye(IntersectionDevice *device,
 	sampleResult.isCaustic = pathInfo.IsCausticPath(event, bsdf.GetGlossiness(), hybridBackForwardGlossinessThreshold);
 
 	// Add radiance from the light source
-	sampleResult.radiance[light.GetID()] = connectionThroughput * flux * fluxToRadianceFactor * bsdfEval;
+	sampleResult.radiance[light.GetID()] = ApplyStandardDispersionColor(
+			connectionThroughput * flux * fluxToRadianceFactor * bsdfEval,
+			dispersionUsed);
 }
 
 //------------------------------------------------------------------------------
@@ -814,6 +858,7 @@ void PathTracer::RenderLightSample(IntersectionDevice *device,
 	sampleResults.clear();
 
 	Spectrum lightPathFlux;
+	bool dispersionUsed = false;
 
 	const float timeSample = sampler.GetSample(8);
 	const float time = scene.GetCamera().GenerateRayTime(timeSample);
@@ -890,7 +935,8 @@ void PathTracer::RenderLightSample(IntersectionDevice *device,
 						sampler.GetSample(sampleOffset + 1),
 						sampler.GetSample(sampleOffset + 2),
 						sampler.GetSample(sampleOffset + 3),
-						*light, bsdf, lightPathFlux, pathInfo, sampleResults);
+						*light, bsdf, lightPathFlux, pathInfo, sampleResults,
+						dispersionUsed);
 			}
 
 			if (pathInfo.depth.depth == maxPathDepth.depth - 1)
@@ -904,10 +950,13 @@ void PathTracer::RenderLightSample(IntersectionDevice *device,
 			Vector sampledDir;
 			BSDFEvent bsdfEvent;
 			float cosSampleDir;
+			ResetStandardDispersionBounceEvent();
 			Spectrum bsdfSample = bsdf.Sample(&sampledDir,
 						sampler.GetSample(sampleOffset + 4),
 						sampler.GetSample(sampleOffset + 5),
 					&bsdfPdf, &cosSampleDir, &bsdfEvent);
+			dispersionUsed = dispersionUsed ||
+					ConsumeStandardDispersionBounceEvent();
 			if (bsdfSample.Black())
 				break;
 
@@ -989,6 +1038,11 @@ void PathTracer::RenderSample(PathTracerThreadState &state) const {
 			// Trace an eye path
 			auto& sampler = state.GetEyeSampler();
 			auto& sampleResults = state.GetEyeSampleResults();
+			if (state.IsStandardDispersionPathSamplingEnabled())
+				SetStandardDispersionPathSample(Lerp(
+						sampler.GetSample(eyeSampleBootSize - 1), 380.f, 780.f));
+			else
+				ClearStandardDispersionPathSample();
 			RenderEyeSample(
 				state.device,
 				state.scene,
@@ -1001,6 +1055,11 @@ void PathTracer::RenderSample(PathTracerThreadState &state) const {
 			// Otherwise trace a light path
 			auto& sampler = state.GetLightSampler();
 			auto& sampleResults = state.GetLightSampleResults();
+			if (state.IsStandardDispersionPathSamplingEnabled())
+				SetStandardDispersionPathSample(Lerp(
+						sampler.GetSample(lightSampleBootSize - 1), 380.f, 780.f));
+			else
+				ClearStandardDispersionPathSample();
 			RenderLightSample(
 				state.device,
 				state.scene,
@@ -1015,6 +1074,7 @@ void PathTracer::RenderSample(PathTracerThreadState &state) const {
 	// Render sample
 	auto [sampler, sampleResults] = Render();
 	assert(&sampleResults == &state.GetEyeSampleResults() || &sampleResults == &state.GetLightSampleResults());
+	ClearStandardDispersionPathSample();
 
 	// Apply variance clamping
 	ApplyVarianceClamp(state, sampleResults);
@@ -1088,6 +1148,22 @@ void PathTracer::ParseOptions(
 	lightSampleSize = 
 		lightSampleBootSize + // To generate eye ray
 		maxPathDepth.depth * lightSampleStepSize; // For each path vertex
+	standardDispersionSampleDimensionReserved = false;
+}
+
+void PathTracer::ReserveStandardDispersionSampleDimension() {
+	if (standardDispersionSampleDimensionReserved)
+		return;
+
+	// Insert one low Sobol dimension directly after the fixed camera/light boot
+	// samples. All per-vertex dimensions move by one while retaining their
+	// internal layout. This avoids the color bias of a wavelength dimension at
+	// the end of a deep path's sample vector.
+	++eyeSampleBootSize;
+	++eyeSampleSize;
+	++lightSampleBootSize;
+	++lightSampleSize;
+	standardDispersionSampleDimensionReserved = true;
 }
 
 //------------------------------------------------------------------------------
@@ -1142,7 +1218,7 @@ PropertiesUPtr PathTracer::GetDefaultProps() {
 			Property("path.pathdepth.diffuse")(4) <<
 			Property("path.pathdepth.glossy")(4) <<
 			Property("path.pathdepth.specular")(6) <<
-			Property("path.russianroulette.depth")(3) <<
+			Property("path.russianroulette.depth")(16) <<
 			Property("path.russianroulette.cap")(.5f) <<
 			Property("path.clamping.variance.maxvalue")(0.f) <<
 			Property("path.forceblackbackground.enable")(false) <<

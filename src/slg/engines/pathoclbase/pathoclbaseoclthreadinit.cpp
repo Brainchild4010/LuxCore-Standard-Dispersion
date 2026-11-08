@@ -360,6 +360,8 @@ void PathOCLBaseOCLRenderThread::InitSamplerSharedDataBuffer() {
 	const u_int *subRegion = renderEngine->GetFilm().GetSubRegion();
 	const u_int filmRegionPixelCount = (subRegion[1] - subRegion[0] + 1) * (subRegion[3] - subRegion[2] + 1);
 
+	const u_int gpuEyeSampleSize = renderEngine->pathTracer.eyeSampleSize +
+			(renderEngine->pathTracer.IsStandardDispersionSampleDimensionReserved() ? 0 : 1);
 	size_t size = 0;
 	if (renderEngine->oclSampler->type == slg::ocl::RANDOM) {
 		size += sizeof(slg::ocl::RandomSamplerSharedData);
@@ -372,13 +374,13 @@ void PathOCLBaseOCLRenderThread::InitSamplerSharedDataBuffer() {
 		size += sizeof(u_int) * filmRegionPixelCount;
 
 		// Plus the Sobol directions array
-		size += sizeof(u_int) * renderEngine->pathTracer.eyeSampleSize * SOBOL_BITS;
+		size += sizeof(u_int) * gpuEyeSampleSize * SOBOL_BITS;
 	} else if (renderEngine->oclSampler->type == slg::ocl::TILEPATHSAMPLER) {
 		size += sizeof(slg::ocl::TilePathSamplerSharedData);
 
 		switch (renderEngine->GetType()) {
 			case TILEPATHOCL:
-				size += sizeof(u_int) * renderEngine->pathTracer.eyeSampleSize * SOBOL_BITS;
+				size += sizeof(u_int) * gpuEyeSampleSize * SOBOL_BITS;
 				break;
 			case RTPATHOCL:
 				break;
@@ -420,7 +422,7 @@ void PathOCLBaseOCLRenderThread::InitSamplerSharedDataBuffer() {
 		// end of slg::ocl::SobolSamplerSharedData + all pass values
 
 		u_int *sobolDirections = (u_int *)(buffer + sizeof(slg::ocl::SobolSamplerSharedData) + sizeof(u_int) * filmRegionPixelCount);
-		SobolSequence::GenerateDirectionVectors(sobolDirections, renderEngine->pathTracer.eyeSampleSize);
+		SobolSequence::GenerateDirectionVectors(sobolDirections, gpuEyeSampleSize);
 
 		// Write the data
 		intersectionDevice->EnqueueWriteBuffer(samplerSharedDataBuff, CL_TRUE, size, buffer);
@@ -435,7 +437,7 @@ void PathOCLBaseOCLRenderThread::InitSamplerSharedDataBuffer() {
 
 				// Initialize the Sobol directions array values
 				u_int *sobolDirections = (u_int *)(buffer + sizeof(slg::ocl::TilePathSamplerSharedData));
-				SobolSequence::GenerateDirectionVectors(sobolDirections, renderEngine->pathTracer.eyeSampleSize);
+				SobolSequence::GenerateDirectionVectors(sobolDirections, gpuEyeSampleSize);
 
 				intersectionDevice->EnqueueWriteBuffer(samplerSharedDataBuff, CL_TRUE, size, &buffer[0]);
 				delete [] buffer;
@@ -500,6 +502,8 @@ void PathOCLBaseOCLRenderThread::InitSampleResultsBuffer() {
 void PathOCLBaseOCLRenderThread::InitSampleDataBuffer() {
 	const u_int taskCount = renderEngine->taskCount;
 
+	const u_int gpuEyeSampleSize = renderEngine->pathTracer.eyeSampleSize +
+			(renderEngine->pathTracer.IsStandardDispersionSampleDimensionReserved() ? 0 : 1);
 	size_t uDataSize;
 	if (renderEngine->oclSampler->type == slg::ocl::RANDOM) {
 		// To store IDX_SCREEN_X and IDX_SCREEN_Y
@@ -509,7 +513,7 @@ void PathOCLBaseOCLRenderThread::InitSampleDataBuffer() {
 		uDataSize = 2 * sizeof(float);
 	} else if (renderEngine->oclSampler->type == slg::ocl::METROPOLIS) {
 		// Metropolis needs 2 sets of samples, the current and the proposed mutation
-		uDataSize = 2 * sizeof(float) * renderEngine->pathTracer.eyeSampleSize;
+		uDataSize = 2 * sizeof(float) * gpuEyeSampleSize;
 	} else if (renderEngine->oclSampler->type == slg::ocl::TILEPATHSAMPLER) {
 		// To store IDX_SCREEN_X and IDX_SCREEN_Y
 		uDataSize = 2 * sizeof(float);

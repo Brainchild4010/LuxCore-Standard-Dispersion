@@ -52,7 +52,8 @@ public:
 			const SamplerUPtr& lightSampler,
 			SceneConstRef scene, FilmRef film,
 			const VarianceClamping *varianceClamping,
-			const bool useFilmSplat = false);
+			const bool useFilmSplat = false,
+			const bool standardDispersionPathSampling = false);
 	virtual ~PathTracerThreadState();
 
 	SamplerRef GetEyeSampler() { return *eyeSampler; }
@@ -67,6 +68,9 @@ public:
 
 	std::vector<SampleResult> & GetEyeSampleResults() { return std::ref(eyeSampleResults); }
 	std::vector<SampleResult> & GetLightSampleResults() { return std::ref(lightSampleResults); }
+	bool IsStandardDispersionPathSamplingEnabled() const {
+		return standardDispersionPathSampling;
+	}
 
 	// Used for hybrid rendering
 	double eyeSampleCount, lightSampleCount;
@@ -76,6 +80,7 @@ private:
 	const SamplerUPtr& lightSampler;
 	FilmRef film;
 	std::vector<SampleResult> eyeSampleResults, lightSampleResults;
+	const bool standardDispersionPathSampling;
 };
 
 class PhotonGICache;
@@ -103,6 +108,10 @@ public:
 		luxrays::PropertiesConstRef cfg,
 		const luxrays::Properties &defaultProps
 	);
+	void ReserveStandardDispersionSampleDimension();
+	bool IsStandardDispersionSampleDimensionReserved() const {
+		return standardDispersionSampleDimensionReserved;
+	}
 
 	DirectLightResult DirectLightSampling(
 		luxrays::IntersectionDevice *device, SceneConstRef scene,
@@ -111,7 +120,8 @@ public:
 		const float u3, const float u4,
 		const EyePathInfo &pathInfo, const luxrays::Spectrum &pathThrouput,
 		const BSDF &bsdf, SampleResult *sampleResult,
-		const bool useBSDFEVal = true) const;
+		const bool useBSDFEVal = true,
+		const bool dispersionUsed = false) const;
 
 	void RenderEyePath(
 		luxrays::IntersectionDevice *device,
@@ -161,6 +171,7 @@ public:
 	// Used for Sampler indices
 	u_int eyeSampleBootSize, eyeSampleStepSize, eyeSampleSize;
 	u_int lightSampleBootSize, lightSampleStepSize, lightSampleSize;
+	bool standardDispersionSampleDimensionReserved;
 
 	// Path depth settings
 	PathDepthInfo maxPathDepth;
@@ -192,10 +203,11 @@ private:
 	void DirectHitFiniteLight(SceneConstRef scene, const EyePathInfo &pathInfo,
 			const luxrays::Spectrum &pathThrouput, const luxrays::Ray &ray,
 			const float distance, const BSDF &bsdf,
-			SampleResult *sampleResult) const;
+			SampleResult *sampleResult, const bool dispersionUsed) const;
 	void DirectHitInfiniteLight(SceneConstRef scene, const EyePathInfo &pathInfo,
 			const luxrays::Spectrum &pathThrouput, const luxrays::Ray &ray,
-			const BSDF *bsdf, SampleResult *sampleResult) const;
+			const BSDF *bsdf, SampleResult *sampleResult,
+			const bool dispersionUsed) const;
 	bool CheckDirectHitVisibilityFlags(LightSourceConstRef lightSource,
 			const PathDepthInfo &depthInfo,	const BSDFEvent lastBSDFEvent) const;
 
@@ -207,7 +219,8 @@ private:
 			const float u0, const float u1, const float u2,
 			const LightSource &light,  const BSDF &bsdf,
 			const luxrays::Spectrum &flux, const LightPathInfo &pathInfo,
-			std::vector<SampleResult> &sampleResults) const;
+			std::vector<SampleResult> &sampleResults,
+			const bool dispersionUsed) const;
 
 	FilterDistribution *pixelFilterDistribution;
 	const PhotonGICache *photonGICache;

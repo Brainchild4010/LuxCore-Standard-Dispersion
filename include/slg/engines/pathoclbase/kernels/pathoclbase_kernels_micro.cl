@@ -769,6 +769,7 @@ __kernel void AdvancePaths_MK_GENERATE_NEXT_VERTEX_RAY(
 	float cosSampledDir;
 	float bsdfPdfW;
 	BSDFEvent bsdfEvent;
+	bool standardDispersionBounce = false;
 
 	if (BSDF_IsShadowCatcher(bsdf MATERIALS_PARAM) && (tasksDirectLight[gid].directLightResult != SHADOWED)) {
 		bsdfSample = BSDF_ShadowCatcherSample(bsdf,
@@ -789,11 +790,35 @@ __kernel void AdvancePaths_MK_GENERATE_NEXT_VERTEX_RAY(
 			cosSampledDir = -1.f;
 			bsdfEvent = pathInfo->lastBSDFEvent;
 		} else {
+			float bsdfU0 = Sampler_GetSample(taskConfig,
+					sampleOffset + IDX_BSDF_X SAMPLER_PARAM);
+			float bsdfU1 = Sampler_GetSample(taskConfig,
+					sampleOffset + IDX_BSDF_Y SAMPLER_PARAM);
+
+			// Keep the BSDF/HitPoint ABI untouched. Ideal glass does not otherwise
+			// use u1, so a negative u1 safely marks the integrated GPU estimator.
+			// u0 then carries the wavelength selected once for this eye path.
+			__global const Material *sampleMaterial = &mats[bsdf->materialIndex];
+			const bool integratedStandardDispersion =
+					(sampleMaterial->type == GLASS) &&
+					(sampleMaterial->glass.cauchyBTex != NULL_INDEX);
+			if (integratedStandardDispersion) {
+				bsdfU0 = clamp((taskState->standardDispersionWaveLength - 380.f) /
+						400.f, 0.f, 1.f);
+				bsdfU1 = -1.f;
+			}
+
 			bsdfSample = BSDF_Sample(bsdf,
-					Sampler_GetSample(taskConfig, sampleOffset + IDX_BSDF_X SAMPLER_PARAM),
-					Sampler_GetSample(taskConfig, sampleOffset + IDX_BSDF_Y SAMPLER_PARAM),
+					bsdfU0, bsdfU1,
 					&sampledDir, &bsdfPdfW, &cosSampledDir, &bsdfEvent
 					MATERIALS_PARAM);
+
+			if (integratedStandardDispersion && !Spectrum_IsBlack(bsdfSample)) {
+				const float cauchyB = Texture_GetFloatValue(
+						sampleMaterial->glass.cauchyBTex,
+						&bsdf->hitPoint TEXTURES_PARAM);
+				standardDispersionBounce = (cauchyB > 0.f);
+			}
 
 			pathInfo->isPassThroughPath = false;
 		}
@@ -824,6 +849,11 @@ __kernel void AdvancePaths_MK_GENERATE_NEXT_VERTEX_RAY(
 		// RR increases path contribution
 		throughputFactor /= rrProb;
 		throughputFactor *= bsdfSample;
+		if (standardDispersionBounce && !taskState->standardDispersionUsed) {
+			throughputFactor *= GlassMaterial_WaveLength2CIERGB(
+					taskState->standardDispersionWaveLength);
+			taskState->standardDispersionUsed = true;
+		}
 
 		VSTORE3F(throughputFactor * VLOAD3F(taskState->throughput.c), taskState->throughput.c);
 

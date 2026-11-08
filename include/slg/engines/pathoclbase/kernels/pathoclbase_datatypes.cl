@@ -90,6 +90,10 @@ typedef struct {
 	PathState state;
 
 	Spectrum throughput;
+	// Standard LuxCore dispersion mini-mod: one wavelength is shared by the
+	// complete GPU eye path and its CIE reconstruction is applied only once.
+	float standardDispersionWaveLength;
+	int standardDispersionUsed;
 	BSDF bsdf; // Variable size structure
 
 	Seed seedPassThroughEvent;
